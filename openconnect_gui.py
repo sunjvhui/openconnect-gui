@@ -23,10 +23,11 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 APP_NAME = "OpenConnect GUI"
@@ -34,6 +35,17 @@ APP_VERSION = "1.0.0"
 
 CONFIG_DIR = Path.home() / ".openconnect-gui"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
+DEBUG_LOG = CONFIG_DIR / "debug.log"
+
+
+def debug_log(msg):
+    """追加调试日志到 ~/.openconnect-gui/debug.log（用于诊断界面回调异常）"""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 OPENCONNECT = shutil.which("openconnect") or "/opt/homebrew/bin/openconnect"
 
@@ -114,7 +126,7 @@ def keychain_set(profile_name, account, secret):
         subprocess.run(
             ["security", "add-generic-password", "-U",
              "-a", account or "-", "-s", keychain_service(profile_name), "-w", secret],
-            check=True, capture_output=True)
+            check=True, capture_output=True, timeout=10)
         return True
     except Exception:
         return False
@@ -127,7 +139,7 @@ def keychain_get(profile_name, account):
         r = subprocess.run(
             ["security", "find-generic-password",
              "-a", account or "-", "-s", keychain_service(profile_name), "-w"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return r.stdout.strip() or None
     except Exception:
@@ -142,7 +154,7 @@ def keychain_delete(profile_name, account):
         subprocess.run(
             ["security", "delete-generic-password",
              "-a", account or "-", "-s", keychain_service(profile_name)],
-            capture_output=True)
+            capture_output=True, timeout=10)
     except Exception:
         pass
 
@@ -245,7 +257,7 @@ class VPNConnection:
 # 输入对话框 (用于 OTP / 二次密码 / sudo 密码等)
 # ============================================================
 class PromptDialog(tk.Toplevel):
-    def __init__(self, master, title, message, masked=True):
+    def __init__(self, master, title, message, masked=True, initial=""):
         super().__init__(master)
         self.title(title)
         self.resizable(False, False)
@@ -254,7 +266,7 @@ class PromptDialog(tk.Toplevel):
 
         ttk.Label(self, text=message, wraplength=380).pack(anchor="w", pady=(0, 10))
 
-        self.var = tk.StringVar()
+        self.var = tk.StringVar(value=initial)
         ent = ttk.Entry(self, textvariable=self.var, width=42,
                         show="•" if masked else "")
         ent.pack(fill="x", pady=(0, 14))
@@ -308,6 +320,39 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
         self.after(1000, self._tick_clock)
+        if "--autotest" in sys.argv:
+            self.after(1500, self._run_autotest)
+
+    def report_callback_exception(self, exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        debug_log("Tk 回调异常:\n" + text)
+        try:
+            self.log_line("⚠ 界面异常: " + text.strip(), "err")
+        except Exception:
+            pass
+
+    # ---------------- 自测: 模拟点击「连接」 ----------------
+    def _run_autotest(self):
+        debug_log("AUTOTEST: 开始模拟点击「连接」")
+        self.var_host.set("127.0.0.1")
+        self.var_port.set("1")
+        self.var_user.set("autotest")
+        self.var_pw.set("autotest-pass")
+        real_ensure = self._ensure_sudo
+        self._ensure_sudo = lambda: (debug_log("AUTOTEST: _ensure_sudo → mock True"), True)[1]
+        try:
+            self._do_connect()
+            debug_log("AUTOTEST: _do_connect 正常返回")
+        except Exception:
+            debug_log("AUTOTEST: _do_connect 异常:\n" + traceback.format_exc())
+        finally:
+            self._ensure_sudo = real_ensure
+        self.after(9000, self._autotest_finish)
+
+    def _autotest_finish(self):
+        alive = bool(self.conn and self.conn.alive)
+        debug_log(f"AUTOTEST 结束: state={self.state} alive={alive}")
+        self.destroy()
 
     # ---------------- 样式 ----------------
     def _setup_style(self):
@@ -515,17 +560,20 @@ class App(tk.Tk):
     def _poll(self):
         try:
             while True:
-                kind, val = self.q.get_nowait()
+                try:
+                    kind, val = self.q.get_nowait()
+                except queue.Empty:
+                    break
                 if kind == "log":
                     self._on_line(val)
                 elif kind == "ended":
                     self._on_ended(val)
-        except queue.Empty:
-            pass
-        # 弹出排队的提示
-        if not self._prompt_open and self._pending_prompts:
-            title, msg, masked = self._pending_prompts.pop(0)
-            self._show_prompt(title, msg, masked)
+            # 弹出排队的提示
+            if not self._prompt_open and self._pending_prompts:
+                title, msg, masked = self._pending_prompts.pop(0)
+                self._show_prompt(title, msg, masked)
+        except Exception:
+            debug_log("_poll 异常:\n" + traceback.format_exc())
         self.after(100, self._poll)
 
     def _on_line(self, line):
@@ -608,7 +656,21 @@ class App(tk.Tk):
         self.after(1000, self._tick_clock)
 
     # ---------------- 连接 ----------------
-    def _on_connect(self):
+    def _on_connect(self, event=None):
+        debug_log("用户点击「连接」")
+        try:
+            self._do_connect()
+        except Exception:
+            text = traceback.format_exc()
+            debug_log("连接异常:\n" + text)
+            try:
+                self.log_line("⚠ 连接异常: " + text.strip(), "err")
+                messagebox.showerror(APP_NAME, "连接时发生错误:\n" + text[-800:], parent=self)
+            except Exception:
+                pass
+
+    def _do_connect(self):
+        debug_log(f"表单读取: state={self.state}")
         if self.state != ST_DISCONNECTED:
             if messagebox.askyesno(APP_NAME, "当前已有连接，是否断开后重新连接？", parent=self):
                 self._on_disconnect()
@@ -623,6 +685,7 @@ class App(tk.Tk):
         if not user:
             messagebox.showwarning(APP_NAME, "请填写用户名。", parent=self)
             return
+        debug_log(f"表单: host={host!r} port={self.var_port.get()!r} user={user!r} proto={protocol!r}")
 
         # 获取密码: 输入框 → 钥匙串
         pw = self.var_pw.get()
@@ -640,10 +703,14 @@ class App(tk.Tk):
         if not shutil.which(OPENCONNECT):
             messagebox.showerror(APP_NAME, "未找到 openconnect，请先安装:\n  brew install openconnect", parent=self)
             return
+        debug_log(f"openconnect 路径 OK: {OPENCONNECT}, euid={os.geteuid()}")
 
         # sudo 权限
         if os.geteuid() != 0:
-            if not self._ensure_sudo():
+            debug_log("开始 sudo 权限检查")
+            ok = self._ensure_sudo()
+            debug_log(f"sudo 权限检查结果: {ok}")
+            if not ok:
                 return
 
         # 构造命令
@@ -666,6 +733,7 @@ class App(tk.Tk):
         if self.var_nodtls.get():
             cmd.append("--no-dtls")
 
+        debug_log("spawn: " + " ".join(cmd))
         self._pw_prompts_seen = 0
         self._pending_prompts.clear()
         self.conn = VPNConnection(self.q)
@@ -677,6 +745,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"启动 openconnect 失败:\n{e}", parent=self)
             self._set_state(ST_DISCONNECTED)
             return
+        debug_log(f"进程已启动 pid={self.conn.proc.pid}")
         self._set_state(ST_CONNECTING)
 
         # 自动保存配置(勾选记住密码时)
@@ -691,9 +760,12 @@ class App(tk.Tk):
             self._sudo_ok_nopass = True
             return True
         for _ in range(3):
-            pw = simpledialog.askstring(
-                "管理员密码", "openconnect 需要 root 权限来配置网络。\n请输入你的 Mac 管理员密码:",
-                show="•", parent=self)
+            dlg = PromptDialog(
+                self, "管理员密码",
+                "openconnect 需要 root 权限来配置网络。\n请输入你的 Mac 管理员密码:",
+                masked=True)
+            self.wait_window(dlg)
+            pw = dlg.result
             if pw is None:
                 return False
             if sudo_validate_password(pw):
@@ -798,7 +870,9 @@ class App(tk.Tk):
             return
         name = self._current_profile_name() or host.split(":")[0]
         if not silent:
-            name = simpledialog.askstring("保存配置", "配置名称:", initialvalue=name, parent=self)
+            dlg = PromptDialog(self, "保存配置", "配置名称:", masked=False, initial=name)
+            self.wait_window(dlg)
+            name = dlg.result
             if not name:
                 return
         p = self._form_to_profile(name)
