@@ -78,6 +78,7 @@ RE_PROMPT_KEYWORD = re.compile(
     r"continue|confirm|yes/no|y/n|\[[0-9a-z/]+\])", re.I)
 RE_CONNECTED = re.compile(r"(Connected\s+(as|to)\b|DTLS\s+connected)", re.I)
 RE_ERROR = re.compile(r"(error|failed|failure|denied|refused|incorrect)", re.I)
+RE_SERVERCERT = re.compile(r"pin-sha256:[A-Za-z0-9+/=]{20,}")
 RE_WARN = re.compile(r"(warn|warning)", re.I)
 
 
@@ -96,6 +97,7 @@ class Profile:
     no_dtls: bool = False
     proxy: str = ""
     cafile: str = ""
+    servercert: str = ""
 
 
 def load_profiles():
@@ -331,6 +333,7 @@ class App(tk.Tk):
         self._prompt_candidate_timer = None
         self._last_line_time = time.time()
         self._suppress_prompts = False
+        self._pending_servercert = None
         self._pw_prompts_seen = 0
         self._sudo_ok_nopass = False
 
@@ -514,6 +517,11 @@ class App(tk.Tk):
         self.var_nodtls = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.adv, text="禁用 DTLS（提高兼容性）", variable=self.var_nodtls).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(self.adv, text="证书指纹").grid(row=3, column=0, sticky="w", pady=5, padx=(0, 8))
+        self.var_servercert = tk.StringVar()
+        ttk.Entry(self.adv, textvariable=self.var_servercert, width=34).grid(row=3, column=1, sticky="w")
+        ttk.Label(self.adv, text="pin-sha256:…（首次连接失败时自动捕获）",
+                  foreground="#777").grid(row=3, column=2, sticky="w", padx=(8, 0))
 
         # 连接按钮
         btnrow = ttk.Frame(right)
@@ -612,6 +620,12 @@ class App(tk.Tk):
         else:
             kind = None
         self.log_line(line, kind)
+
+        # 服务器证书验证失败时 openconnect 会给出 pin-sha256 指纹, 自动捕获
+        m = RE_SERVERCERT.search(line)
+        if m and m.group(0) != self.var_servercert.get().strip():
+            self._pending_servercert = m.group(0)
+            self.log_line(f"➜ 已捕获服务器证书指纹: {m.group(0)}", "warn")
 
         # sudo 密码提示
         if RE_SUDO_PROMPT.search(line):
@@ -785,6 +799,8 @@ class App(tk.Tk):
             cmd += ["--proxy", self.var_proxy.get().strip()]
         if self.var_ca.get().strip():
             cmd += ["--cafile", self.var_ca.get().strip()]
+        if self.var_servercert.get().strip():
+            cmd += ["--servercert", self.var_servercert.get().strip()]
         if self.var_nodtls.get():
             cmd.append("--no-dtls")
 
@@ -792,6 +808,7 @@ class App(tk.Tk):
         self._pw_prompts_seen = 0
         self._pending_prompts.clear()
         self._suppress_prompts = False
+        self._pending_servercert = None
         self.conn = VPNConnection(self.q)
         self.log_line(f"$ {' '.join(cmd)}", "dim")
         self.log_line(f"➜ 正在连接 {server} ({PROTOCOL_LABELS.get(protocol, protocol)})…", "dim")
@@ -821,6 +838,43 @@ class App(tk.Tk):
         self.log_line(f"➜ openconnect 进程已退出 (code={code})", "dim" if code == 0 else "err")
         if self.state != ST_DISCONNECTED:
             self._set_state(ST_DISCONNECTED)
+        pin = self._pending_servercert
+        if pin and code != 0:
+            self._pending_servercert = None
+            self.after(400, lambda: self._offer_server_trust(pin))
+
+    def _offer_server_trust(self, pin):
+        """证书验证失败后一键信任该服务器证书指纹并自动重连"""
+        host = self.var_host.get().strip()
+        ok = messagebox.askyesno(
+            "信任服务器证书",
+            f"服务器 {host} 的证书未通过系统验证\n"
+            f"(自签名或私有 CA, 公司 VPN 常见)。\n\n"
+            f"证书指纹:\n{pin}\n\n"
+            f"是否信任该证书并自动重连?\n"
+            f"(指纹将保存到配置, 仅对该服务器生效)\n\n"
+            f"⚠ 注意: 若该指纹与预期不符, 可能存在中间人风险。",
+            parent=self)
+        if not ok:
+            self.log_line("➜ 已拒绝信任服务器证书, 未保存", "warn")
+            return
+        self._store_servercert(pin)
+        self.log_line("➜ 已信任服务器证书, 正在自动重连…", "ok")
+        self.after(300, self._do_connect)
+
+    def _store_servercert(self, value):
+        """保存证书指纹到当前配置(不触碰钥匙串)"""
+        self.var_servercert.set(value)
+        name = self._current_profile_name()
+        for prof in self.profiles:
+            if prof.name == name:
+                prof.servercert = value
+                break
+        else:
+            p = self._form_to_profile(name)
+            p.servercert = value
+            self.profiles.append(p)
+        save_profiles(self.profiles, last=name)
 
     # ---------------- 配置管理 ----------------
     def _current_profile_name(self):
@@ -842,6 +896,7 @@ class App(tk.Tk):
             no_dtls=self.var_nodtls.get(),
             proxy=self.var_proxy.get().strip(),
             cafile=self.var_ca.get().strip(),
+            servercert=self.var_servercert.get().strip(),
         )
 
     def _profile_to_form(self, p: Profile):
@@ -854,6 +909,7 @@ class App(tk.Tk):
         self.var_nodtls.set(bool(p.no_dtls))
         self.var_proxy.set(p.proxy or "")
         self.var_ca.set(p.cafile or "")
+        self.var_servercert.set(p.servercert or "")
         # 尝试从钥匙串取密码
         self.var_pw.set("")
         if p.remember_password and p.username and keychain_available():
@@ -888,6 +944,7 @@ class App(tk.Tk):
         self.var_nodtls.set(False)
         self.var_proxy.set("")
         self.var_ca.set("")
+        self.var_servercert.set("")
         if not silent:
             self.log_line("➜ 新配置，填写后点击「保存配置」", "dim")
             self.focus_set()
