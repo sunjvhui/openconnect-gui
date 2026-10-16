@@ -626,6 +626,8 @@ class App(tk.Tk):
         if m and m.group(0) != self.var_servercert.get().strip():
             self._pending_servercert = m.group(0)
             self.log_line(f"➜ 已捕获服务器证书指纹: {m.group(0)}", "warn")
+            # openconnect 验证失败后可能挂起等待交互而非退出, 不等 ended 事件
+            self.after(600, lambda pin=m.group(0): self._cert_failure_flow(pin))
 
         # sudo 密码提示
         if RE_SUDO_PROMPT.search(line):
@@ -842,6 +844,24 @@ class App(tk.Tk):
         if pin and code != 0:
             self._pending_servercert = None
             self.after(400, lambda: self._offer_server_trust(pin))
+
+    def _cert_failure_flow(self, pin):
+        """证书验证失败: 主动结束挂起的失败进程, 立即询问是否信任并重连"""
+        if self._pending_servercert != pin:
+            return  # 已被 ended 事件或用户处理过
+        self._pending_servercert = None
+        # 取消可能在等待的提示候选定时器
+        if self._prompt_candidate_timer:
+            try:
+                self.after_cancel(self._prompt_candidate_timer)
+            except Exception:
+                pass
+            self._prompt_candidate_timer = None
+        if self.conn and self.conn.alive:
+            self.log_line("➜ 结束本次证书验证失败的连接进程…", "dim")
+            self.conn.stop()
+        self._set_state(ST_DISCONNECTED)
+        self._offer_server_trust(pin)
 
     def _offer_server_trust(self, pin):
         """证书验证失败后一键信任该服务器证书指纹并自动重连"""
