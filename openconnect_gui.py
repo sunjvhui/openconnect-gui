@@ -24,6 +24,14 @@ import sys
 import threading
 import time
 import traceback
+
+# 打包环境(py2app)下把内嵌的 Tcl/Tk 脚本库路径告诉解释器
+if getattr(sys, "frozen", False):
+    _res = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(sys.executable))), "Resources")
+    if os.path.exists(os.path.join(_res, "lib", "tcl9.1", "init.tcl")):
+        os.environ.setdefault("TCL_LIBRARY", os.path.join(_res, "lib", "tcl9.1"))
+        os.environ.setdefault("TK_LIBRARY", os.path.join(_res, "lib", "tk9.1"))
+
 import tkinter as tk
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -32,6 +40,10 @@ from tkinter.scrolledtext import ScrolledText
 
 APP_NAME = "OpenConnect GUI"
 APP_VERSION = "1.0.0"
+
+# 从 Finder 启动时 PATH 缺少 /opt/homebrew/bin, 补上以便找到 openconnect 等
+os.environ["PATH"] = ("/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:"
+                      + os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"))
 
 CONFIG_DIR = Path.home() / ".openconnect-gui"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
@@ -1118,6 +1130,13 @@ class App(tk.Tk):
 
 
 def main():
+    if "--selfcheck" in sys.argv:
+        r = tk.Tk()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (CONFIG_DIR / "selfcheck.txt").write_text(
+            f"OK {sys.version.split()[0]} Tcl/Tk {r.tk.call('info', 'patchlevel')}", encoding="utf-8")
+        r.destroy()
+        return
     app = App()
     app.mainloop()
 
