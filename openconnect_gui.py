@@ -162,20 +162,22 @@ def keychain_delete(profile_name, account):
 # ============================================================
 # sudo 校验
 # ============================================================
-def sudo_nopass_ok():
-    try:
-        return subprocess.run(["sudo", "-n", "-v"], capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        return False
-
-
-def sudo_validate_password(pw):
-    try:
-        r = subprocess.run(["sudo", "-S", "-v"], input=(pw + "\n"),
-                           capture_output=True, text=True, timeout=15)
-        return r.returncode == 0
-    except Exception:
-        return False
+def ensure_askpass():
+    """创建 macOS 原生提权辅助脚本（sudo -A 用），返回路径；非 macOS 返回 None"""
+    if sys.platform != "darwin":
+        return None
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / "askpass.sh"
+    script = (
+        "#!/bin/sh\n"
+        "exec /usr/bin/osascript -e "
+        "'display dialog \"OpenConnect GUI 需要 root 权限运行 openconnect，请输入管理员密码：\" "
+        "default answer \"\" with hidden answer' "
+        "-e 'text returned of result' 2>/dev/null\n"
+    )
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o700)
+    return path
 
 
 # ============================================================
@@ -193,7 +195,7 @@ class VPNConnection:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, argv, first_input=None):
+    def start(self, argv, first_input=None, env=None):
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -202,6 +204,7 @@ class VPNConnection:
             text=True,
             bufsize=1,              # 行缓冲
             start_new_session=True, # 独立进程组, 断开时可整组清理
+            env=env,
         )
         if first_input is not None:
             self.send(first_input)
@@ -334,19 +337,20 @@ class App(tk.Tk):
     # ---------------- 自测: 模拟点击「连接」 ----------------
     def _run_autotest(self):
         debug_log("AUTOTEST: 开始模拟点击「连接」")
+        dummy = CONFIG_DIR / "askpass-dummy.sh"
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        dummy.write_text("#!/bin/sh\necho wrong-password\n", encoding="utf-8")
+        dummy.chmod(0o700)
+        self._get_askpass = lambda: dummy
         self.var_host.set("127.0.0.1")
         self.var_port.set("1")
         self.var_user.set("autotest")
         self.var_pw.set("autotest-pass")
-        real_ensure = self._ensure_sudo
-        self._ensure_sudo = lambda: (debug_log("AUTOTEST: _ensure_sudo → mock True"), True)[1]
         try:
             self._do_connect()
             debug_log("AUTOTEST: _do_connect 正常返回")
         except Exception:
             debug_log("AUTOTEST: _do_connect 异常:\n" + traceback.format_exc())
-        finally:
-            self._ensure_sudo = real_ensure
         self.after(9000, self._autotest_finish)
 
     def _autotest_finish(self):
@@ -705,20 +709,22 @@ class App(tk.Tk):
             return
         debug_log(f"openconnect 路径 OK: {OPENCONNECT}, euid={os.geteuid()}")
 
-        # sudo 权限
-        if os.geteuid() != 0:
-            debug_log("开始 sudo 权限检查")
-            ok = self._ensure_sudo()
-            debug_log(f"sudo 权限检查结果: {ok}")
-            if not ok:
-                return
-
-        # 构造命令
+        # sudo 权限: macOS 用原生 askpass 弹窗(sudo -A)，凭票据缓存自动跳过
+        spawn_env = None
         port = self.var_port.get().strip()
         server = host if (":" in host or not port) else f"{host}:{port}"
         cmd = []
         if os.geteuid() != 0:
-            cmd += ["sudo", "-n"]
+            if not shutil.which("sudo"):
+                messagebox.showerror(APP_NAME, "未找到 sudo。", parent=self)
+                return
+            askpass = self._get_askpass()
+            if askpass:
+                cmd += ["sudo", "-A"]
+                spawn_env = dict(os.environ, SUDO_ASKPASS=str(askpass))
+                debug_log(f"使用 sudo -A + askpass: {askpass}")
+            else:
+                cmd += ["sudo", "-n"]
         cmd += [OPENCONNECT,
                 "--protocol", protocol,
                 "--server", server,
@@ -740,7 +746,7 @@ class App(tk.Tk):
         self.log_line(f"$ {' '.join(cmd)}", "dim")
         self.log_line(f"➜ 正在连接 {server} ({PROTOCOL_LABELS.get(protocol, protocol)})…", "dim")
         try:
-            self.conn.start(cmd, first_input=pw)
+            self.conn.start(cmd, first_input=pw, env=spawn_env)
         except Exception as e:
             messagebox.showerror(APP_NAME, f"启动 openconnect 失败:\n{e}", parent=self)
             self._set_state(ST_DISCONNECTED)
@@ -752,26 +758,8 @@ class App(tk.Tk):
         if self.var_remember.get():
             self._save_current_profile(silent=True)
 
-    def _ensure_sudo(self):
-        if not shutil.which("sudo"):
-            messagebox.showerror(APP_NAME, "未找到 sudo。", parent=self)
-            return False
-        if self._sudo_ok_nopass or sudo_nopass_ok():
-            self._sudo_ok_nopass = True
-            return True
-        for _ in range(3):
-            dlg = PromptDialog(
-                self, "管理员密码",
-                "openconnect 需要 root 权限来配置网络。\n请输入你的 Mac 管理员密码:",
-                masked=True)
-            self.wait_window(dlg)
-            pw = dlg.result
-            if pw is None:
-                return False
-            if sudo_validate_password(pw):
-                return True
-            messagebox.showwarning(APP_NAME, "密码错误，请重试。", parent=self)
-        return False
+    def _get_askpass(self):
+        return ensure_askpass()
 
     def _on_disconnect(self):
         if self.conn and self.conn.alive:
