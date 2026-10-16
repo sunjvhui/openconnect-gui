@@ -71,6 +71,11 @@ RE_PASSWORD_PROMPT = re.compile(
     r"(second\s*password|password|passcode|pass\s*phrase|otp|one[-\s]?time|"
     r"token\s*code|verification\s*code|mfa|2fa|code)", re.I)
 RE_SUDO_PROMPT = re.compile(r"(\[sudo\]\s*password|password\s+for\s+.+:)", re.I)
+RE_PROMPT_KEYWORD = re.compile(
+    r"(password|passcode|pass\s*phrase|otp|one[-\s]?time|second|factor|token|"
+    r"verification|verify|mfa|2fa|dynamic|\u5b89\u5168\u7801|\u52a8\u6001|\u9a8c\u8bc1\u7801|\u5bc6\u7801|"
+    r"username|user\s*name|gateway|group|select|choose|choice|accept|"
+    r"continue|confirm|yes/no|y/n|\[[0-9a-z/]+\])", re.I)
 RE_CONNECTED = re.compile(r"(Connected\s+(as|to)\b|DTLS\s+connected)", re.I)
 RE_ERROR = re.compile(r"(error|failed|failure|denied|refused|incorrect)", re.I)
 RE_WARN = re.compile(r"(warn|warning)", re.I)
@@ -260,7 +265,7 @@ class VPNConnection:
 # 输入对话框 (用于 OTP / 二次密码 / sudo 密码等)
 # ============================================================
 class PromptDialog(tk.Toplevel):
-    def __init__(self, master, title, message, masked=True, initial=""):
+    def __init__(self, master, title, message, masked=True, initial="", allow_suppress=False):
         super().__init__(master)
         self.title(title)
         self.resizable(False, False)
@@ -275,6 +280,12 @@ class PromptDialog(tk.Toplevel):
         ent.pack(fill="x", pady=(0, 14))
         ent.focus_set()
 
+        self.suppress = False
+        if allow_suppress:
+            self.var_sup = tk.BooleanVar(value=False)
+            ttk.Checkbutton(self, text="本次连接内不再自动弹出（可改用「手动输入…」）",
+                            variable=self.var_sup).pack(anchor="w", pady=(0, 10))
+
         btns = ttk.Frame(self)
         btns.pack(fill="x")
         ttk.Button(btns, text="取消", command=self._cancel).pack(side="right", padx=(8, 0))
@@ -286,7 +297,11 @@ class PromptDialog(tk.Toplevel):
         self.grab_set()
 
     def _ok(self):
+        if not self.var.get().strip():
+            return          # 空输入不发送, 防止误触导致服务器重复提问
         self.result = self.var.get()
+        if hasattr(self, "var_sup"):
+            self.suppress = bool(self.var_sup.get())
         self.grab_release()
         self.destroy()
 
@@ -312,6 +327,10 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self._prompt_open = False
         self._pending_prompts = []      # [(title, message, masked)]
+        self._prompt_candidate = None
+        self._prompt_candidate_timer = None
+        self._last_line_time = time.time()
+        self._suppress_prompts = False
         self._pw_prompts_seen = 0
         self._sudo_ok_nopass = False
 
@@ -581,6 +600,7 @@ class App(tk.Tk):
         self.after(100, self._poll)
 
     def _on_line(self, line):
+        self._last_line_time = time.time()
         if RE_ERROR.search(line):
             kind = "err"
         elif RE_WARN.search(line):
@@ -598,25 +618,54 @@ class App(tk.Tk):
             self._queue_prompt("需要 sudo 密码", line.strip(), masked=True, sudo=True)
             return
 
-        # 交互提示 (以冒号结尾)
-        if RE_PROMPT_TAIL.search(line):
+        # 交互提示: 行尾冒号 + 关键词 → 先记为候选, 静默 1.8s 后才真正弹框
+        if (self.state != ST_DISCONNECTED and self.conn and self.conn.alive
+                and not self._suppress_prompts
+                and RE_PROMPT_TAIL.search(line)
+                and len(line) < 120
+                and RE_PROMPT_KEYWORD.search(line)):
             if RE_PASSWORD_PROMPT.search(line):
                 self._pw_prompts_seen += 1
                 if self._pw_prompts_seen == 1:
-                    return  # 第一个密码提示已自动发送
-                self._queue_prompt("请输入", line.strip(), masked=True)
-            else:
-                # 组选择 / 其他提示
-                self._queue_prompt("请输入", line.strip(), masked=False)
+                    return  # 首个密码提示已随连接自动发送
+            self._arm_prompt_candidate(line.strip())
 
     def _queue_prompt(self, title, msg, masked, sudo=False):
         self._pending_prompts.append((("sudo 密码" if sudo else title), msg, masked))
 
+    def _arm_prompt_candidate(self, line):
+        """记录提示候选行; 若后续 1.8s 内无新输出则判定 openconnect 阻塞等待输入"""
+        debug_log(f"提示候选: {line!r}")
+        if self._prompt_candidate_timer:
+            try:
+                self.after_cancel(self._prompt_candidate_timer)
+            except Exception:
+                pass
+        self._prompt_candidate = line
+        self._prompt_candidate_timer = self.after(1800, self._fire_prompt_candidate)
+
+    def _fire_prompt_candidate(self):
+        self._prompt_candidate_timer = None
+        line, self._prompt_candidate = self._prompt_candidate, None
+        if not line or self._prompt_open or self._suppress_prompts:
+            return
+        if not (self.conn and self.conn.alive):
+            return
+        # 静默期内又有新输出 → 是流式日志而非阻塞提示, 放弃
+        if time.time() - self._last_line_time < 1.6:
+            return
+        masked = bool(RE_PASSWORD_PROMPT.search(line))
+        debug_log(f"静默确认通过, 弹出输入框: {line!r} masked={masked}")
+        self._queue_prompt("请输入", line, masked)
+
     def _show_prompt(self, title, msg, masked):
         self._prompt_open = True
-        dlg = PromptDialog(self, title, msg, masked=masked)
+        dlg = PromptDialog(self, title, msg, masked=masked, allow_suppress=True)
         self.wait_window(dlg)
         self._prompt_open = False
+        if getattr(dlg, "suppress", False):
+            self._suppress_prompts = True
+            self.log_line("➜ 已停用自动弹窗; 需要时请点「手动输入…」", "dim")
         if dlg.result is not None and self.conn:
             self.log_line(f"➜ 已发送输入 ({'*' * len(dlg.result) if masked else dlg.result})", "dim")
             self.conn.send(dlg.result)
@@ -742,6 +791,7 @@ class App(tk.Tk):
         debug_log("spawn: " + " ".join(cmd))
         self._pw_prompts_seen = 0
         self._pending_prompts.clear()
+        self._suppress_prompts = False
         self.conn = VPNConnection(self.q)
         self.log_line(f"$ {' '.join(cmd)}", "dim")
         self.log_line(f"➜ 正在连接 {server} ({PROTOCOL_LABELS.get(protocol, protocol)})…", "dim")
